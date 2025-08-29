@@ -287,8 +287,75 @@ CFG
 fi
 
 # ---------------- PRODUCTION: releases + deploy service + webhook ----------------
-# (unchanged from v2.3)
-# ... keep the production block from v2.3 verbatim ...
+Options FollowSymLinks
+</Directory>
+ProxyPreserveHost On
+RewriteEngine On
+RewriteCond %{HTTP:Upgrade} =websocket [NC]
+RewriteRule ^/code/(.*)$ ws://127.0.0.1:8080/\$1 [P,L]
+RewriteCond %{HTTP:Upgrade} !=websocket [NC]
+RewriteRule ^/code/(.*)$ http://127.0.0.1:8080/\$1 [P,L]
+ProxyPassReverse /code/ http://127.0.0.1:8080/
+Alias /hooks/github /opt/${SITE}/hooks/github-webhook.php
+<Directory /opt/${SITE}/hooks>
+Require all granted
+Options FollowSymLinks
+</Directory>
+RemoteIPHeader CF-Connecting-IP
+RemoteIPTrustedProxy 127.0.0.1
+ErrorLog \${APACHE_LOG_DIR}/${SITE}-error.log
+CustomLog \${APACHE_LOG_DIR}/${SITE}-access.log combined
+</VirtualHost>
+APACHE
+}
+reload_apache(){ apachectl configtest || fail "apache2 configtest failed"; systemctl reload apache2 || true; }
+main(){ local ref=""; ref=$(latest_tag); [[ -z "$ref" ]] && { log "No tag matches $TAG_PATTERN"; exit 0; }; local already=""; [[ -L "$CURRENT_LINK" && -f "${CURRENT_LINK}/.deploy_ref" ]] && already=$(cat "${CURRENT_LINK}/.deploy_ref") || true; if [[ "$already" == "$ref" ]]; then log "Already on $ref"; exit 0; fi; local ts tgt; ts=$(date +%Y%m%d%H%M%S); tgt="${RELEASES_DIR}/${ts}-${ref}"; log "Deploying $ref -> $tgt"; clone_ref "$ref" "$tgt"; link_shared "$tgt"; run_composer "$tgt"; echo "$ref" > "${tgt}/.deploy_ref"; chown -R www-data:www-data "$tgt"; switch_current "$tgt"; prune_releases; local docroot="$CURRENT_LINK"; [[ -d "${CURRENT_LINK}/public" ]] && docroot="${CURRENT_LINK}/public"; write_vhost "$docroot"; reload_apache; log "Deploy complete: $ref"; }
+main "$@"
+BASH
+chmod +x "$DEPLOY_SCRIPT"
+
+
+# systemd service
+cat > /etc/systemd/system/deploy@.service <<SERVICE
+[Unit]
+Description=Deploy site %i
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=${DEPLOY_SCRIPT} %i
+User=root
+Group=root
+[Install]
+WantedBy=multi-user.target
+SERVICE
+systemctl daemon-reload
+
+
+# Webhook (prod only)
+WEBHOOK_SECRET_FILE="${ETC_SITE}/webhook.secret"; [[ -f "$WEBHOOK_SECRET_FILE" ]] || head -c 32 /dev/urandom | base64 > "$WEBHOOK_SECRET_FILE"
+WEBHOOK_SECRET=$(cat "$WEBHOOK_SECRET_FILE")
+cat > "${HOOKS_DIR}/github-webhook.php" <<PHP
+<?php
+\$secret = trim(file_get_contents('${WEBHOOK_SECRET_FILE}'));
+\$sig = \$_SERVER['HTTP_X_HUB_SIGNATURE_256'] ?? '';
+\$event = \$_SERVER['HTTP_X_GITHUB_EVENT'] ?? '';
+\$payload = file_get_contents('php://input');
+function bad(\$c){ http_response_code(\$c); exit; }
+if (empty(\$sig) || empty(\$event)) bad(400);
+\$calc = 'sha256=' . hash_hmac('sha256', \$payload, \$secret);
+if (!hash_equals(\$calc, \$sig)) bad(403);
+\$data = json_decode(\$payload, true);
+if (\$event === 'release' && (\$data['action'] ?? '') === 'published') { @exec('systemctl start deploy@${FQDN}.service > /dev/null 2>&1 &'); http_response_code(202); echo 'deploy queued'; exit; }
+http_response_code(204);
+PHP
+chown -R www-data:www-data "$HOOKS_DIR"; chmod 640 "$HOOKS_DIR/github-webhook.php"
+
+
+# Initial deploy and webhook summary
+systemctl start "deploy@${FQDN}.service" || true
+say "Webhook URL: https://${FQDN}/hooks/github"; echo "Webhook secret: ${WEBHOOK_SECRET}"
+fi
 
 # ---------------- Final summary ----------------
 DOC_NOW="/var/www/html"
