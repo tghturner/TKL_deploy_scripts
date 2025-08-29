@@ -2,11 +2,19 @@
 set -euo pipefail
 
 # =============================================================
-# TurnKey LAMP one‑shot setup — v2.4
-# Changes from v2.3:
-#   • DEV now prompts for Git author.name and author.email and configures them
-#     for user 'coder' (global + repo-local). Defaults: name=$GH_USER, email=dev@$FQDN
-#   • Rest unchanged: DEV uses bind mounts for runtime dirs; no sudo used.
+# TurnKey LAMP one‑shot setup — v2.5
+# Modes:
+#   - production: immutable releases from tags + deploy@ service + webhook
+#   - dev: single editable working tree (no releases/rollback), code-server @ /code,
+#          **bind-mounts** runtime dirs into /srv/<fqdn>/shared (no symlinks)
+# Notes:
+#   • No 'sudo' usage. Uses runuser(1) via as_user().
+#   • Remembers answers for reruns (/etc/tkl-setup/defaults.env); reuses keys.
+#   • Apache vhost written with printf/echo (no fragile heredocs); /code proxy w/ WS.
+#   • Cloudflared forwards whole host to Apache (TLS via Cloudflare).
+#   • Composer at root + nested composer.json files.
+#   • ACLs + setgid + UMask=0002 so editor writes are allowed.
+#   • Dev converts any old shared symlinks to bind mounts automatically.
 # =============================================================
 
 export DEBIAN_FRONTEND=noninteractive
@@ -45,7 +53,7 @@ GH_REPO=$(prompt "GitHub repo name (e.g. my-app)" "${GH_REPO:-}")
 DEFAULT_BRANCH=$(prompt "Default branch for dev (ignored for production)" "${DEFAULT_BRANCH:-main}")
 TAG_PATTERN=$(prompt "Production: tag pattern to match (glob)" "${TAG_PATTERN:-v*}")
 WRITABLE_DIRS=$(prompt "Writable directories (space-separated, relative to project root)" "${WRITABLE_DIRS:-uploads storage cache logs sessions}")
-# NEW in v2.4
+# Git identity for dev commits
 GIT_NAME=$(prompt "[dev] Git author.name" "${GIT_NAME:-$GH_USER}")
 GIT_EMAIL=$(prompt "[dev] Git author.email" "${GIT_EMAIL:-dev@${FQDN}}")
 
@@ -102,52 +110,46 @@ setfacl -dR -m g:www-data:rwX "$SQLITE_DIR" "$SHARED_DIR" || true
 
 # ---------------- Apache global ServerName & vhost ----------------
 mkdir -p /etc/apache2/conf-available
-cat > "/etc/apache2/conf-available/servername-${FQDN}.conf" <<CONF
-ServerName ${FQDN}
-CONF
+printf 'ServerName %s\n' "$FQDN" > "/etc/apache2/conf-available/servername-${FQDN}.conf"
 a2enconf "servername-${FQDN}" >/dev/null || true
 
 # need wstunnel for code-server
 a2enmod proxy proxy_http proxy_wstunnel headers rewrite alias remoteip >/dev/null || true
 
 VHOST_CONF="/etc/apache2/sites-available/${FQDN}.conf"
-cat > "$VHOST_CONF" <<APACHE
-<VirtualHost *:80>
-  ServerName ${FQDN}
-  ServerAdmin webmaster@localhost
-
-  DocumentRoot /var/www/html
-  <Directory /var/www/>
-    AllowOverride All
-    Require all granted
-    Options FollowSymLinks
-  </Directory>
-
-  # /code -> code-server
-  ProxyPreserveHost On
-  RewriteEngine On
-  # WebSocket upgrade
-  RewriteCond %{HTTP:Upgrade} =websocket [NC]
-  RewriteRule ^${CODE_PATH}/(.*)$ ws://127.0.0.1:8080/\$1 [P,L]
-  # Plain HTTP
-  RewriteCond %{HTTP:Upgrade} !=websocket [NC]
-  RewriteRule ^${CODE_PATH}/(.*)$ http://127.0.0.1:8080/\$1 [P,L]
-  ProxyPassReverse ${CODE_PATH}/ http://127.0.0.1:8080/
-
-  # GitHub webhook endpoint (prod only behavior; dev returns 204)
-  Alias /hooks/github ${HOOKS_DIR}/github-webhook.php
-  <Directory ${HOOKS_DIR}>
-    Require all granted
-    Options FollowSymLinks
-  </Directory>
-
-  RemoteIPHeader CF-Connecting-IP
-  RemoteIPTrustedProxy 127.0.0.1
-
-  ErrorLog \${APACHE_LOG_DIR}/${FQDN}-error.log
-  CustomLog \${APACHE_LOG_DIR}/${FQDN}-access.log combined
-</VirtualHost>
-APACHE
+{
+  echo "<VirtualHost *:80>"
+  echo "  ServerName $FQDN"
+  echo "  ServerAdmin webmaster@localhost"
+  echo ""
+  echo "  DocumentRoot /var/www/html"
+  echo "  <Directory /var/www/>"
+  echo "    AllowOverride All"
+  echo "    Require all granted"
+  echo "    Options FollowSymLinks"
+  echo "  </Directory>"
+  echo ""
+  echo "  # /code -> code-server"
+  echo "  ProxyPreserveHost On"
+  echo "  RewriteEngine On"
+  echo "  RewriteCond %{HTTP:Upgrade} =websocket [NC]"
+  echo "  RewriteRule ^${CODE_PATH}/(.*)$ ws://127.0.0.1:8080/\\$1 [P,L]"
+  echo "  RewriteCond %{HTTP:Upgrade} !=websocket [NC]"
+  echo "  RewriteRule ^${CODE_PATH}/(.*)$ http://127.0.0.1:8080/\\$1 [P,L]"
+  echo "  ProxyPassReverse ${CODE_PATH}/ http://127.0.0.1:8080/"
+  echo ""
+  echo "  Alias /hooks/github ${HOOKS_DIR}/github-webhook.php"
+  echo "  <Directory ${HOOKS_DIR}>"
+  echo "    Require all granted"
+  echo "    Options FollowSymLinks"
+  echo "  </Directory>"
+  echo ""
+  echo "  RemoteIPHeader CF-Connecting-IP"
+  echo "  RemoteIPTrustedProxy 127.0.0.1"
+  echo "  ErrorLog \\${APACHE_LOG_DIR}/${FQDN}-error.log"
+  echo "  CustomLog \\${APACHE_LOG_DIR}/${FQDN}-access.log combined"
+  echo "</VirtualHost>"
+} > "$VHOST_CONF"
 
 a2dissite 000-default >/dev/null 2>&1 || true
 a2ensite "$FQDN" >/dev/null
@@ -249,12 +251,12 @@ CFG
   else
     as_user coder "cd '${WORKTREE}' && git remote set-url origin '${REPO_SSH}' && git fetch --all --prune && git checkout '${DEFAULT_BRANCH}' && git pull --ff-only || true"
   fi
-  # Ensure repo-local identity as well (overrides global if needed)
-  as_user coder "cd '${WORKTREE}' && git config user.name '${GIT_NAME}' && git config user.email '${GIT_EMAIL}'"
+  # repo-local identity just in case
+  as_user coder "cd '${WORKTREE}' && git config user.name '${GIT_NAME}' && git config user.email '${GIT_EMAIL}'" || true
 
   ensure_bind(){
     local rel="$1"; local mp="$WORKTREE/$rel"; local tgt="$SHARED_DIR/$rel"
-    if [[ -L "$mp" ]]; then rm -f "$mp"; fi
+    [[ -L "$mp" ]] && rm -f "$mp"
     mkdir -p "$tgt" "$mp"
     chown -R www-data:www-data "$tgt"; chmod -R 770 "$tgt"
     setfacl -R -m u:coder:rwX,g:www-data:rwX "$tgt" || true
@@ -263,9 +265,9 @@ CFG
     setfacl -R -m u:coder:rwX,g:www-data:rwX "$mp" || true
     setfacl -dR -m u:coder:rwX,g:www-data:rwX "$mp" || true
     if ! mountpoint -q "$mp"; then
-      if [[ -n $(ls -A "$mp" 2>/dev/null) ]]; then rsync -a "$mp"/ "$tgt"/; fi
+      [[ -n $(ls -A "$mp" 2>/dev/null) ]] && rsync -a "$mp"/ "$tgt"/
     fi
-    if ! mountpoint -q "$mp"; then mount --bind "$tgt" "$mp"; fi
+    mountpoint -q "$mp" || mount --bind "$tgt" "$mp"
     local fstab_line="$tgt $mp none bind 0 0"; grep -qsF "$fstab_line" /etc/fstab || echo "$fstab_line" >> /etc/fstab
   }
   for d in $WRITABLE_DIRS; do ensure_bind "$d"; done
@@ -276,10 +278,9 @@ CFG
 
   # Vhost docroot to worktree(/public)
   DOCROOT="$WORKTREE"; [[ -d "${WORKTREE}/public" ]] && DOCROOT="${WORKTREE}/public"
-  sed -i \
-    -e "s#^\s*DocumentRoot\s\+.*#  DocumentRoot ${DOCROOT}#" \
-    -e "/<Directory \/var\/www\/>/,/<\/Directory>/c\  <Directory ${DOCROOT}>\n    AllowOverride All\n    Require all granted\n    Options FollowSymLinks\n  </Directory>" \
-    "$VHOST_CONF"
+  # Rewrite the DocumentRoot & Directory block idempotently
+  TMP=$(mktemp)
+  awk -v d="$DOCROOT" 'BEGIN{done=0} {print} /ServerAdmin/{if(!done){print "  DocumentRoot " d "\n  <Directory " d ">\n    AllowOverride All\n    Require all granted\n    Options FollowSymLinks\n  </Directory>\n"; done=1}}' "$VHOST_CONF" > "$TMP" && mv "$TMP" "$VHOST_CONF"
   apachectl configtest && systemctl reload apache2 || true
 
   say "Dev workspace ready: ${WORKTREE}. Runtime dirs are bind-mounted from ${SHARED_DIR}."
@@ -287,24 +288,76 @@ CFG
 fi
 
 # ---------------- PRODUCTION: releases + deploy service + webhook ----------------
-Options FollowSymLinks
-</Directory>
-ProxyPreserveHost On
-RewriteEngine On
-RewriteCond %{HTTP:Upgrade} =websocket [NC]
-RewriteRule ^/code/(.*)$ ws://127.0.0.1:8080/\$1 [P,L]
-RewriteCond %{HTTP:Upgrade} !=websocket [NC]
-RewriteRule ^/code/(.*)$ http://127.0.0.1:8080/\$1 [P,L]
-ProxyPassReverse /code/ http://127.0.0.1:8080/
-Alias /hooks/github /opt/${SITE}/hooks/github-webhook.php
-<Directory /opt/${SITE}/hooks>
-Require all granted
-Options FollowSymLinks
-</Directory>
-RemoteIPHeader CF-Connecting-IP
-RemoteIPTrustedProxy 127.0.0.1
-ErrorLog \${APACHE_LOG_DIR}/${SITE}-error.log
-CustomLog \${APACHE_LOG_DIR}/${SITE}-access.log combined
+if [[ "$MODE" == "production" ]]; then
+  SSH_DIR="/root/.ssh"; mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
+  KEY_PREFIX="${SSH_DIR}/${FQDN}_deploy_ed25519"
+  if [[ ! -f "${KEY_PREFIX}" ]]; then
+    ssh-keygen -t ed25519 -N "" -f "${KEY_PREFIX}" -C "deploy-${FQDN}"
+    say "\n==== Add this DEPLOY KEY (read‑only) to GitHub: ${GH_USER}/${GH_REPO}"
+    echo "-----8<----- PUBLIC KEY -----8<-----"; cat "${KEY_PREFIX}.pub"; echo "-----8<----- END -----8<-----"
+  fi
+  ssh-keyscan -H github.com >> "${SSH_DIR}/known_hosts" 2>/dev/null || true
+  REPO_SSH="git@github.com:${GH_USER}/${GH_REPO}.git"
+  while ! GIT_SSH_COMMAND="ssh -i ${KEY_PREFIX} -o StrictHostKeyChecking=yes" git ls-remote "$REPO_SSH" HEAD >/dev/null 2>&1; do
+    err "Deploy key not yet permitted. Add the key above to the repo and press Enter to retry."; read -r _ || true
+  done
+
+  # Persist config for deploy script (prod)
+  printf '%s\n' production > "${ETC_SITE}/mode"
+  printf '%s\n' "$DEFAULT_BRANCH" > "${ETC_SITE}/branch"
+  printf '%s\n' "$TAG_PATTERN" > "${ETC_SITE}/tag_pattern"
+  printf '%s\n' "$DATA_ROOT" > "${ETC_SITE}/data_root"
+  printf '%s\n' "$WRITABLE_DIRS" > "${ETC_SITE}/writable"
+  printf '%s\n' "$REPO_SSH" > "${ETC_SITE}/repo_ssh"
+  printf '%s\n' "$KEY_PREFIX" > "${ETC_SITE}/ssh_key"
+
+  # Deploy script (immutable releases)
+  DEPLOY_SCRIPT="/usr/local/bin/deploy-site.sh"
+  cat > "$DEPLOY_SCRIPT" <<'BASH'
+#!/usr/bin/env bash
+set -euo pipefail
+SITE="$1"; SITE_ROOT="/var/www/${SITE}"; RELEASES_DIR="${SITE_ROOT}/releases"; CURRENT_LINK="${SITE_ROOT}/current"; ETC_SITE="/etc/${SITE}"
+DATA_ROOT=$(cat "${ETC_SITE}/data_root"); SHARED_DIR="${DATA_ROOT}/shared"; SQLITE_DIR="${DATA_ROOT}/sqlite"; WRITABLE_DIRS=$(cat "${ETC_SITE}/writable"); MODE=$(cat "${ETC_SITE}/mode"); BRANCH=$(cat "${ETC_SITE}/branch"); TAG_PATTERN=$(cat "${ETC_SITE}/tag_pattern"); REPO_SSH=$(cat "${ETC_SITE}/repo_ssh"); KEY_PATH=$(cat "${ETC_SITE}/ssh_key")
+LOGFILE="/var/log/deploy-${SITE}.log"; ENV_FILE="/etc/${SITE}/.env"; VHOST_CONF="/etc/apache2/sites-available/${SITE}.conf"
+log(){ echo "[$(date +'%F %T')] $*" | tee -a "$LOGFILE"; }; fail(){ log "ERROR: $*"; exit 1; }
+mkdir -p "$RELEASES_DIR" "$SHARED_DIR" "$SQLITE_DIR"; chown -R www-data:www-data "$SHARED_DIR" "$SQLITE_DIR"; chmod -R 750 "$SHARED_DIR" "$SQLITE_DIR"
+latest_tag(){ GIT_SSH_COMMAND="ssh -i ${KEY_PATH} -o StrictHostKeyChecking=yes" git ls-remote --tags "$REPO_SSH" | awk '{print $2}' | sed -n 's#refs/tags/##p' | grep -E "^${TAG_PATTERN//\*/.*}$" | sort -V | tail -n1; }
+clone_ref(){ local ref="$1" dest="$2"; GIT_SSH_COMMAND="ssh -i ${KEY_PATH} -o StrictHostKeyChecking=yes" git clone --depth 1 --branch "$ref" "$REPO_SSH" "$dest" 2>>"$LOGFILE" || fail "git clone failed (ref=$ref)."; }
+link_shared(){ local dest="$1"; for d in $WRITABLE_DIRS; do mkdir -p "${SHARED_DIR}/${d}"; rm -rf "${dest}/${d}" 2>/dev/null || true; ln -s "${SHARED_DIR}/${d}" "${dest}/${d}"; done; if [[ ! -f "$ENV_FILE" ]]; then mkdir -p "/etc/${SITE}"; cat > "$ENV_FILE" <<ENV
+APP_ENV=production
+APP_DEBUG=false
+SQLITE_DIR=${SQLITE_DIR}
+ENV
+chmod 640 "$ENV_FILE"; chown root:www-data "$ENV_FILE"; fi; ln -sfn "$ENV_FILE" "${dest}/.env" 2>/dev/null || true; }
+run_composer(){ local dest="$1"; if command -v composer >/dev/null 2>&1; then [[ -f "${dest}/composer.json" ]] && (cd "$dest" && COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader 2>>"$LOGFILE") || true; find "$dest" -type f -name composer.json -not -path "*/vendor/*" -not -path "${dest}/composer.json" -printf '%h\n' | sort -u | while read -r sub; do (cd "$sub" && COMPOSER_ALLOW_SUPERUSER=1 composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader 2>>"$LOGFILE") || true; done; fi; }
+switch_current(){ local new="$1"; [[ -L "$CURRENT_LINK" ]] && ln -sfn "$(readlink -f "$CURRENT_LINK")" "${SITE_ROOT}/previous" || true; ln -sfn "$new" "$CURRENT_LINK"; }
+prune_releases(){ ls -1dt ${RELEASES_DIR}/* 2>/dev/null | tail -n +6 | xargs -r rm -rf; }
+write_vhost(){ local docroot="$1"; cat > "$VHOST_CONF" <<APACHE
+<VirtualHost *:80>
+  ServerName ${SITE}
+  ServerAdmin webmaster@localhost
+  DocumentRoot ${docroot}
+  <Directory ${SITE_ROOT}/current>
+    AllowOverride All
+    Require all granted
+    Options FollowSymLinks
+  </Directory>
+  ProxyPreserveHost On
+  RewriteEngine On
+  RewriteCond %{HTTP:Upgrade} =websocket [NC]
+  RewriteRule ^/code/(.*)$ ws://127.0.0.1:8080/\$1 [P,L]
+  RewriteCond %{HTTP:Upgrade} !=websocket [NC]
+  RewriteRule ^/code/(.*)$ http://127.0.0.1:8080/\$1 [P,L]
+  ProxyPassReverse /code/ http://127.0.0.1:8080/
+  Alias /hooks/github /opt/${SITE}/hooks/github-webhook.php
+  <Directory /opt/${SITE}/hooks>
+    Require all granted
+    Options FollowSymLinks
+  </Directory>
+  RemoteIPHeader CF-Connecting-IP
+  RemoteIPTrustedProxy 127.0.0.1
+  ErrorLog \${APACHE_LOG_DIR}/${SITE}-error.log
+  CustomLog \${APACHE_LOG_DIR}/${SITE}-access.log combined
 </VirtualHost>
 APACHE
 }
@@ -312,11 +365,10 @@ reload_apache(){ apachectl configtest || fail "apache2 configtest failed"; syste
 main(){ local ref=""; ref=$(latest_tag); [[ -z "$ref" ]] && { log "No tag matches $TAG_PATTERN"; exit 0; }; local already=""; [[ -L "$CURRENT_LINK" && -f "${CURRENT_LINK}/.deploy_ref" ]] && already=$(cat "${CURRENT_LINK}/.deploy_ref") || true; if [[ "$already" == "$ref" ]]; then log "Already on $ref"; exit 0; fi; local ts tgt; ts=$(date +%Y%m%d%H%M%S); tgt="${RELEASES_DIR}/${ts}-${ref}"; log "Deploying $ref -> $tgt"; clone_ref "$ref" "$tgt"; link_shared "$tgt"; run_composer "$tgt"; echo "$ref" > "${tgt}/.deploy_ref"; chown -R www-data:www-data "$tgt"; switch_current "$tgt"; prune_releases; local docroot="$CURRENT_LINK"; [[ -d "${CURRENT_LINK}/public" ]] && docroot="${CURRENT_LINK}/public"; write_vhost "$docroot"; reload_apache; log "Deploy complete: $ref"; }
 main "$@"
 BASH
-chmod +x "$DEPLOY_SCRIPT"
+  chmod +x "$DEPLOY_SCRIPT"
 
-
-# systemd service
-cat > /etc/systemd/system/deploy@.service <<SERVICE
+  # systemd service
+  cat > /etc/systemd/system/deploy@.service <<SERVICE
 [Unit]
 Description=Deploy site %i
 After=network-online.target
@@ -329,13 +381,12 @@ Group=root
 [Install]
 WantedBy=multi-user.target
 SERVICE
-systemctl daemon-reload
+  systemctl daemon-reload
 
-
-# Webhook (prod only)
-WEBHOOK_SECRET_FILE="${ETC_SITE}/webhook.secret"; [[ -f "$WEBHOOK_SECRET_FILE" ]] || head -c 32 /dev/urandom | base64 > "$WEBHOOK_SECRET_FILE"
-WEBHOOK_SECRET=$(cat "$WEBHOOK_SECRET_FILE")
-cat > "${HOOKS_DIR}/github-webhook.php" <<PHP
+  # Webhook (prod only)
+  WEBHOOK_SECRET_FILE="${ETC_SITE}/webhook.secret"; [[ -f "$WEBHOOK_SECRET_FILE" ]] || head -c 32 /dev/urandom | base64 > "$WEBHOOK_SECRET_FILE"
+  WEBHOOK_SECRET=$(cat "$WEBHOOK_SECRET_FILE")
+  cat > "${HOOKS_DIR}/github-webhook.php" <<PHP
 <?php
 \$secret = trim(file_get_contents('${WEBHOOK_SECRET_FILE}'));
 \$sig = \$_SERVER['HTTP_X_HUB_SIGNATURE_256'] ?? '';
@@ -349,12 +400,11 @@ if (!hash_equals(\$calc, \$sig)) bad(403);
 if (\$event === 'release' && (\$data['action'] ?? '') === 'published') { @exec('systemctl start deploy@${FQDN}.service > /dev/null 2>&1 &'); http_response_code(202); echo 'deploy queued'; exit; }
 http_response_code(204);
 PHP
-chown -R www-data:www-data "$HOOKS_DIR"; chmod 640 "$HOOKS_DIR/github-webhook.php"
+  chown -R www-data:www-data "$HOOKS_DIR"; chmod 640 "$HOOKS_DIR/github-webhook.php"
 
-
-# Initial deploy and webhook summary
-systemctl start "deploy@${FQDN}.service" || true
-say "Webhook URL: https://${FQDN}/hooks/github"; echo "Webhook secret: ${WEBHOOK_SECRET}"
+  # Initial deploy and webhook summary
+  systemctl start "deploy@${FQDN}.service" || true
+  say "Webhook URL: https://${FQDN}/hooks/github"; echo "Webhook secret: ${WEBHOOK_SECRET}"
 fi
 
 # ---------------- Final summary ----------------
